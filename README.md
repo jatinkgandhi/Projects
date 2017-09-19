@@ -1,2 +1,2 @@
 # Projects
-Nice projects
+Private project repository
