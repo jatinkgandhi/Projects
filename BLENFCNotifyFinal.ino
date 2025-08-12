@@ -211,12 +211,11 @@ extern microBox microbox;
 
 extern bool DebugIsON;
 
-#define DEFAULT_SWSERIAL_TXPIN  10
-#define DEFAULT_SWSERIAL_RXPIN  9
 class NFC
 {
   public:
   void init();
+  bool isInitialized(void);
   void showVersionData();
   void readNFC();
   String getLastReadCard(void);
@@ -229,7 +228,6 @@ class NFC
   uint8_t uidLength;                       // Length of the UID (4 or 7 bytes depending on ISO14443A card type)
 
 };
-
 #endif
 // ./BLE.ino
 //-----------------------------------------
@@ -455,6 +453,7 @@ bool BLE::isConnected(void)
 // ./BLENotify.ino
 //-----------------------------------------
   #include <microBox.h>
+  #include <Wire.h>
   #include "LED.h"
   #include "NFC.h"
   #include "BLE.h"
@@ -475,7 +474,7 @@ bool BLE::isConnected(void)
   void help(char **param, uint8_t parCnt)
   {
     Serial.println("Supported commands are., ");
-    Serial.println("help          : This command");
+    Serial.println("help/?        : This command");
     Serial.println("disable_debug : This command disables the debug messages");
     Serial.println("enaable_debug : This command enables the debug messages");
     Serial.println("reset         : This command resets this device");
@@ -487,6 +486,10 @@ bool BLE::isConnected(void)
     Serial.println("lastcard      : Reads last read NFC card and write to console");
     Serial.println("nfcver        : Shows NFC FW version data");
     Serial.println("notifyblenfc  : Reads last read NFC card info via BLE");
+    Serial.println("scanIIC       : Scans for all the devices connected on I2C");
+    #if 0
+    Serial.println("tasklist      : Shows running tasks");
+    #endif
   }
 
   // 1) "disable_debug"
@@ -651,7 +654,58 @@ bool BLE::isConnected(void)
     }
   }
 
+  // 12 scanIIC
+  void scanI2CBus(char **param, uint8_t parCnt)
+  {
+    Wire.begin();
+    Serial.println("Scanning...");
 
+    byte count = 0;
+
+    for (byte address = 1; address < 127; address++) {
+      Wire.beginTransmission(address);
+      byte error = Wire.endTransmission();
+
+      if (error == 0) {
+        Serial.print("I2C device found at address 0x");
+        if (address < 16) Serial.print("0");
+        Serial.print(address, HEX);
+        Serial.println(" !");
+        count++;
+        delay(10);
+      } 
+      else if (error == 4) {
+        Serial.print("Unknown error at address 0x");
+        if (address < 16) Serial.print("0");
+        Serial.println(address, HEX);
+      }
+    }
+
+    if (count == 0)
+      Serial.println("No I2C devices found\n");
+    else
+      Serial.println("Scan complete\n");
+
+  }
+#if 0
+  // 12) "tasklist"
+  void showTasks(char **param, uint8_t parCnt)
+  {
+    // Buffer to store task list (large enough to hold all tasks)
+    char *taskListBuffer = (char *)malloc(1024);
+
+    if (taskListBuffer != NULL) {
+      // Get task list
+      vTaskList(taskListBuffer);
+
+      // Print task list
+      Serial.println("Task Name\tState\tPrio\tStack\tNum");
+      Serial.println(taskListBuffer);
+
+      free(taskListBuffer);
+    }
+  }
+#endif
   ///////////////////////// END OF COMMAND HANDLERS 
   extern bool deviceConnected;
   extern bool oldDeviceConnected;
@@ -685,10 +739,12 @@ PARAM_ENTRY Params[]=
     microbox.begin(&Params[0], hostname, true, historyBuf, 100);
     
     microbox.AddCommand("help"          , help);
+    microbox.AddCommand("?"             , help);
     microbox.AddCommand("disable_debug" , disable_debug);
     microbox.AddCommand("enable_debug"  , enable_debug);
+    microbox.AddCommand("scanIIC"       , scanI2CBus);
     microbox.AddCommand("reset"         , reset_device);
-    microbox.AddCommand("disconnect"    ,BLE_disconnect);
+    microbox.AddCommand("disconnect"    , BLE_disconnect);
     microbox.AddCommand("notifymsg"     , notifymsg);
     microbox.AddCommand("readnfc"       , readNFC);
     microbox.AddCommand("sendmsg"       , sendmsg);
@@ -696,6 +752,11 @@ PARAM_ENTRY Params[]=
     microbox.AddCommand("nfcver"        , nfcVersion);
     microbox.AddCommand("lastcard"      , getLastReadCard);
     microbox.AddCommand("notifyblenfc"  , notifyBLENFC);
+
+
+    #if 0
+    microbox.AddCommand("tasklist"      , showTasks);
+    #endif
 
     if(true == DebugIsON)
     {
@@ -961,17 +1022,35 @@ void loop()
   #include <PN532_I2C.h>
   #include <PN532.h>
   #include <NfcAdapter.h>
+  #include "freertos/FreeRTOS.h"
+  #include "freertos/task.h"
+  #include "freertos/semphr.h"
  
+  #define NFC_INTERRUPT_PIN (3)
+
  /*********************************************************
   *     NFC Reader related variables.                     *
   *********************************************************/
-  
- 
+   
   PN532_I2C pn532i2c(Wire);
   PN532 nfc(pn532i2c);
 
   bool Initialized = false;
   extern bool DebugIsON;
+
+  SemaphoreHandle_t NFCISRSemaphore;
+  
+
+  static void NFCReaderTask(void *param);
+
+  // Interrupt handler.,
+  static void NFCISRHandler()
+  {
+    // Give semaphore from the interrupt handler
+   
+    xSemaphoreGiveFromISR(NFCISRSemaphore, (BaseType_t*)NULL);
+  }
+
 
   void NFC::init(void) {
 
@@ -1029,6 +1108,28 @@ void loop()
       }
     }
 
+    // Finally setup interrupt handler., corresponding semaphore, 
+    // and create a task to read NFC card when interrupt occurs.,
+    pinMode(NFC_INTERRUPT_PIN, INPUT_PULLUP);
+
+    Serial.println("Starting NFC reader task., ");
+    // Create task for Arduino led 
+    xTaskCreate(NFCReaderTask, // Task function
+                "NFCReader", // Task name
+                1024, // Stack size 
+                this, // Pass this NFC object so that we can read it's data
+                0, // Priority
+                (tskTaskControlBlock** )NULL);
+
+    // Create a binary semaphore.
+    NFCISRSemaphore = xSemaphoreCreateBinary();
+    if (NFCISRSemaphore != NULL) {
+      // Attach interrupt for Arduino digital pin
+      attachInterrupt(digitalPinToInterrupt(NFC_INTERRUPT_PIN), NFCISRHandler, FALLING);
+    }
+
+    // Suppress I2C warnings., 
+    // esp_log_level_set("i2c", ESP_LOG_WARN);
   }
 
   void NFC::showVersionData(void)
@@ -1063,26 +1164,73 @@ void loop()
         Serial.println(" bytes");
         Serial.print("UID Value: ");
       }
-      Serial.print("0x");
+      if(true == DebugIsON)
+      {
+        Serial.print("0x");
+      }
 
       lastReadNFCCard += "0x";
 
       for (uint8_t i=0; i < uidLength; i++)
       {
-        Serial.print(uid[i], HEX);
-        lastReadNFCCard += String(uid[i]);
+        if(true == DebugIsON)
+        {
+          Serial.print(uid[i], HEX);
+        }
+        lastReadNFCCard += String(uid[i], HEX);
       }
-      Serial.println("");
+      if(true == DebugIsON)
+      {
+        Serial.println("");
+      }
 
-      // 1 second halt
-      delay(1000);
+      // // 1 second halt
+      // delay(1000); << WHY? TO BE CHECKED!!
     }
   }
 
 
 String NFC::getLastReadCard(void)
 {
-  return lastReadNFCCard;
+  String prevcard;
+  prevcard = "";
+  prevcard = lastReadNFCCard;
+  lastReadNFCCard = "0"; // Destroy the read value once returned., 
+  return prevcard;
+}
+
+static void NFCReaderTask(void *param)
+{
+    NFC *pstNFC = nullptr;
+    Serial.println("Started NFC reader task");
+    Serial.println(param == NULL ? "Empty Param" : "Valid Param");
+    for (;;) {
+    Serial.println("*");
+    /**
+     * Take the semaphore.
+     * https://www.freertos.org/a00122.html
+     */
+    if(NULL != param)
+    {
+      pstNFC = (NFC*) param;
+      // if (xSemaphoreTake(NFCISRSemaphore, portMAX_DELAY) == pdPASS)
+      // {
+        if(NULL != pstNFC && true == pstNFC->isInitialized())
+        {
+          Serial.println("New card detected by ISR");
+          // Read the NFC ID from device to lastReadNFCCard.
+          pstNFC->readNFC();
+        }
+      // }
+    }
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+}
+
+
+bool NFC::isInitialized(void)
+{
+  return (true == Initialized);
 }// ./microBox.cpp
 //-----------------------------------------
 /*
